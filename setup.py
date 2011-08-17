@@ -27,7 +27,7 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=[
-        'Flask'
+        'Flask', 'paypal'
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

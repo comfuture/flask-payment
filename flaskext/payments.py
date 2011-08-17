@@ -10,6 +10,8 @@
     :license: BSD, see LICENSE for more details.
 """
 
+from paypal import PayPalInterface, PayPalConfig
+
 class PaymentsConfigurationError(Exception): pass
 class PaymentsValidationError(Exception): pass
 class PaymentsErrorFromGateway(Exception): pass
@@ -41,7 +43,7 @@ class Payments(object):
         # initialise gateway based on configuration
         self._init_gateway(app)
        
-        self.testing = app.config['TESTING']
+        self.testing = app.config.get('TESTING')
         self.app = app # this Payments instance reference to the Flask app
 
     def _init_gateway(self, app):
@@ -53,14 +55,14 @@ class Payments(object):
         is to delegate to the payment gateway class at this point to give it
         to the opptunity to validate its configuration and fail if needs be.
         """
-        gateways =  {    'PayPal' : PayPalGateway 
-                    }
+        gateways = {
+            'PayPal': PayPalGateway
+        }
         try:
-            self.gateway = gateways[app.config['PAYMENT_API']](app)
+            self.gateway = gateways[app.config.get('PAYMENT_API')](app)
         except KeyError:
             raise PaymentsConfigurationError
 
-            
     def setupRedirect(self, trans):
         """Some gateways such as PayPal WPP Express Checkout and Google payments
         require you to redirect your customer to them first to collect info, 
@@ -88,7 +90,6 @@ class Payments(object):
             return self.gateway.authorise(trans) # gateway implementation does own
         else: raise PaymentTransactionValidationError()
 
-
 class Transaction(object):
     """The payment request value object, with some validation logic
     It look like the way this is going the various gateways will be able to add
@@ -106,8 +107,8 @@ class Transaction(object):
         """
         return True
 
-
-    def __init__(self):
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
         self.authorised = False
         pass
 
@@ -129,15 +130,13 @@ class PayPalGateway:
         """ initialises any stuff needed for the payment gateway API and should
         fail if anything is invalid or missing
         """
-        self.signature_values = {
-        'USER' : app.config['PAYPAL_API_USER'], 
-        'PWD' : app.config['PAYPAL_API_PWD'],
-        'SIGNATURE' : app.config['PAYPAL_API_SIGNATURE'],
-        'VERSION' : '54.0',
-        }
-        self.API_ENDPOINT = app.config['PAYPAL_API_ENDPOINT']
-        self.PAYPAL_URL =  app.config['PAYPAL_API_URL']
-        self.signature = urllib.urlencode(self.signature_values) + "&"
+        config = PayPalConfig(
+            API_ENVIRONMENT=app.config.get('PAYMENT_API_ENVIRONMENT', 'sandbox'),
+            API_USERNAME=app.config.get('PAYPAL_API_USER'),
+            API_PASSWORD=app.config.get('PAYPAL_API_PWD'),
+            API_SIGNATURE=app.config.get('PAYPAL_API_SIGNATURE')
+        )
+        self.interface = PayPalInterface(config)
 
     def setupRedirect(self, trans):
         """ this is for WPP only"""
@@ -152,14 +151,13 @@ class PayPalGateway:
         """ add details to transaction to allow it to be forwarded to the 
         third party gateway 
         """
-        r = self.SetExpressCheckout(
-                trans.amount,
-                trans.return_url,
-                trans.cancel_url
-                )
-        trans.paypal_express_token = urllib.unquote(r)
-        
-        trans.redirect_url = self.PAYPAL_URL + trans.paypal_express_token             
+        def keycase(key):
+            return key.replace('_','').upper()
+        params = dict([(keycase(k), v,) for k, v in trans.__dict__.iteritems()])
+        r = self.SetExpressCheckout(**params)
+        trans.token = r.token
+        trans.next = self.interface.generate_express_checkout_redirect_url(
+                r.token)
         return trans
 
     # Public methods of gateway 'interface'
@@ -177,12 +175,15 @@ class PayPalGateway:
             pass # not implemented yet
         else: raise PaymentTransactionValidationError()
 
-    def _authoriseExpress(self, trans):
+    def _authoriseExpress(self, trans, action='Sale'):
         """ calls authorise on payment setup via redirect to paypal
         """
-        trans._raw = self.DoExpressCheckoutPayment(trans.paypal_express_token,
-                trans.pay_id, trans.amount)  
-        trans.authorised = True 
+        r = self.DoExpressCheckoutPayment(token=trans.token,
+                PAYMENTACTION=action, PAYERID=trans.payerid, AMT=trans.amt,
+                CURRENCYCODE='JPY')
+        trans.transactionid = r.TRANSACTIONID
+        trans.raw = r
+        trans.authorised = True
         return trans
 
     # API METHODS
@@ -201,89 +202,19 @@ class PayPalGateway:
 
     # by Mike Atlas / LowSingle.com / MassWrestling.com, September 2007
     # No License Expressed. Feel free to distribute, modify, 
-#  and use in any open or closed source project without credit to the author
+    # and use in any open or closed source project without credit to the author
 
-    def SetExpressCheckout(self, amount, return_url, cancel_url):
-        params = {
-            'METHOD' : "SetExpressCheckout",
-            'NOSHIPPING' : 1,
-            'PAYMENTACTION' : 'Authorization',
-            'RETURNURL' : return_url,
-            'CANCELURL' : cancel_url, 
-            'AMT' : amount,
-        }
-        params_string = self.signature + urllib.urlencode(params)
-        response = urllib.urlopen(self.API_ENDPOINT, params_string).read()
-        response_token = ""
-        for token in response.split('&'):
-            if token.find("TOKEN=") != -1:
-                response_token = token[ (token.find("TOKEN=")+6):]
-        return response_token
+    def SetExpressCheckout(self, **kwargs):
+        return self.interface.set_express_checkout(**kwargs)
     
-    def DoExpressCheckoutPayment(self, token, payer_id, amt):
-        params = {
-            'METHOD' : "DoExpressCheckoutPayment",
-            'PAYMENTACTION' : 'Sale',
-            'RETURNURL' : 'http://www.yoursite.com/returnurl', #edit this 
-            'CANCELURL' : 'http://www.yoursite.com/cancelurl', #edit this 
-            'TOKEN' : token,
-            'AMT' : amt,
-            'PAYERID' : payer_id,
-        }
-        params_string = self.signature + urllib.urlencode(params)
-        response = urllib.urlopen(self.API_ENDPOINT, params_string).read()
-        response_tokens = {}
-        for token in response.split('&'):
-            response_tokens[token.split("=")[0]] = token.split("=")[1]
-        for key in response_tokens.keys():
-                response_tokens[key] = urllib.unquote(response_tokens[key])
-        return response_tokens
-    
+    def DoExpressCheckoutPayment(self, token, **kwargs):
+        return self.interface.do_express_checkout_payment(token, **kwargs)
 
     # Get info on transaction
-    def GetTransactionDetails(self, tx_id):
-        params = {
-            'METHOD' : "GetTransactionDetails", 
-            'TRANSACTIONID' : tx_id,
-        }
-        params_string = self.signature + urllib.urlencode(params)
-        response = urllib.urlopen(self.API_ENDPOINT, params_string).read()
-        response_tokens = {}
-        for token in response.split('&'):
-            response_tokens[token.split("=")[0]] = token.split("=")[1]
-        for key in response_tokens.keys():
-                response_tokens[key] = urllib.unquote(response_tokens[key])
-        return response_tokens
-   
+    def GetTransactionDetails(self, **kwargs):
+        return self.interface.get_transaction_details(**kwargs)
+
     # Direct payment
-    def DoDirectPayment(self, amt, ipaddress, acct, expdate, cvv2, firstname, lastname, cctype, street, city, state, zipcode):
-        params = {
-            'METHOD' : "DoDirectPayment",
-            'PAYMENTACTION' : 'Sale',
-            'AMT' : amt,
-            'IPADDRESS' : ipaddress,
-            'ACCT': acct,
-            'EXPDATE' : expdate,
-            'CVV2' : cvv2,
-            'FIRSTNAME' : firstname,
-            'LASTNAME': lastname,
-            'CREDITCARDTYPE': cctype,
-            'STREET': street,
-            'CITY': city,
-            'STATE': state,
-            'ZIP':zipcode,
-            'COUNTRY' : 'United States',
-            'COUNTRYCODE': 'US',
-            'RETURNURL' : 'http://www.yoursite.com/returnurl', #why needed? 
-            'CANCELURL' : 'http://www.yoursite.com/cancelurl', # ditto
-            'L_DESC0' : "Desc: ",
-            'L_NAME0' : "Name: ",
-        }
-        params_string = self.signature + urllib.urlencode(params)
-        response = urllib.urlopen(self.API_ENDPOINT, params_string).read()
-        response_tokens = {}
-        for token in response.split('&'):
-            response_tokens[token.split("=")[0]] = token.split("=")[1]
-        for key in response_tokens.keys():
-            response_tokens[key] = urllib.unquote(response_tokens[key])
-        return response_tokens
+    def DoDirectPayment(self, **kwargs):
+        return self.interface.do_direct_payment(**kwargs)
+
